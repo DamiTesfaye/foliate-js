@@ -64,6 +64,115 @@ const rangeFromFlat = (cum, start, end) => {
     return { startIndex: s.index, startOffset: s.offset, endIndex: e.index, endOffset: e.offset }
 }
 
+const PUNCTUATION = /\p{P}/u
+const WORD = /[\p{L}\p{N}]+/gu
+const WORD_CHAR = /[\p{L}\p{N}]/u
+
+const foldChar = (ch, { matchCase, matchDiacritics, locales = 'en' }) => {
+    let out = ch
+    if (!matchDiacritics) out = out.normalize('NFD').replace(/\p{M}/gu, '')
+    if (!matchCase) out = out.toLocaleLowerCase(locales)
+    return out
+}
+
+const foldString = (str, options) => {
+    const { ignorePunctuation } = options
+    let out = ''
+    for (const ch of str) {
+        if (ignorePunctuation && PUNCTUATION.test(ch)) continue
+        out += foldChar(ch, options)
+    }
+    return out
+}
+
+const foldWithMap = (haystack, options) => {
+    const { ignorePunctuation } = options
+    let text = ''
+    const map = []
+    for (let i = 0; i < haystack.length; i++) {
+        const ch = haystack[i]
+        if (ignorePunctuation && PUNCTUATION.test(ch)) continue
+        for (const folded of foldChar(ch, options)) {
+            text += folded
+            map.push(i)
+        }
+    }
+    return { text, map }
+}
+
+const MAX_EDITS = 2
+
+const editBudget = length => Math.min(MAX_EDITS, Math.max(1, Math.floor(length / 4)))
+
+// Optimal string alignment distance, so an adjacent transposition ("quikc" for
+// "quick") costs one edit rather than two.
+const editDistanceWithin = (a, b, max) => {
+    if (Math.abs(a.length - b.length) > max) return max + 1
+    let beforePrev = null
+    let prev = new Array(b.length + 1)
+    for (let j = 0; j <= b.length; j++) prev[j] = j
+    for (let i = 1; i <= a.length; i++) {
+        const row = new Array(b.length + 1)
+        row[0] = i
+        let best = row[0]
+        for (let j = 1; j <= b.length; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1
+            let v = Math.min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + cost)
+            if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1])
+                v = Math.min(v, beforePrev[j - 2] + 1)
+            row[j] = v
+            if (v < best) best = v
+        }
+        if (best > max) return max + 1
+        beforePrev = prev
+        prev = row
+    }
+    return prev[b.length]
+}
+
+const isFuzzyMatch = (candidate, needle) => {
+    const max = editBudget(needle.length)
+    return editDistanceWithin(candidate, needle, max) <= max
+}
+
+const modifierSearch = function* (strs, query, options = {}) {
+    const { mode, fuzzy } = options
+    const haystack = strs.join('')
+    const cum = buildCum(strs)
+    const { text, map } = foldWithMap(haystack, options)
+    const needle = foldString(query, options)
+    if (!needle) return
+
+    const emit = function* (start, end) {
+        const range = rangeFromFlat(cum, map[start], map[end - 1] + 1)
+        yield { range, excerpt: makeExcerpt(strs, range) }
+    }
+
+    if (fuzzy) {
+        const words = [...text.matchAll(WORD)]
+            .map(m => ({ start: m.index, end: m.index + m[0].length }))
+        const queryWords = needle.match(WORD) ?? []
+        if (!queryWords.length) return
+        const span = queryWords.length
+        for (let i = 0; i + span <= words.length; i++) {
+            const start = words[i].start
+            const end = words[i + span - 1].end
+            if (isFuzzyMatch(text.slice(start, end), needle)) yield* emit(start, end)
+        }
+        return
+    }
+
+    const wholeWords = mode === 'whole-words'
+    const atBoundary = (start, end) =>
+        !WORD_CHAR.test(text[start - 1] ?? '') && !WORD_CHAR.test(text[end] ?? '')
+    let index = -1
+    while ((index = text.indexOf(needle, index + 1)) > -1) {
+        const end = index + needle.length
+        if (wholeWords && !atBoundary(index, end)) continue
+        yield* emit(index, end)
+    }
+}
+
 const simpleSearch = function* (strs, query, options = {}) {
     const { locales = 'en', sensitivity } = options
     const matchCase = sensitivity === 'variant'
@@ -213,9 +322,13 @@ const makeNearbyExcerpt = (haystack, matched) => {
 // Distance is measured in words (not characters) and comes from the option, not
 // from the query string, so trailing numbers stay literal search words.
 const nearbyWordsSearch = function* (strs, query, options = {}) {
-    const { locales = 'en', sensitivity = 'base', nearbyWords = 10 } = options
+    const { locales = 'en', sensitivity = 'base', nearbyWords = 10, fuzzy, ignorePunctuation } = options
+    const prepare = w => (ignorePunctuation || fuzzy ? foldString(w, options) : w)
     const queryWords = []
-    for (const w of query.split(/\s+/).filter(Boolean)) if (!queryWords.includes(w)) queryWords.push(w)
+    for (const w of query.split(/\s+/).filter(Boolean)) {
+        const prepared = prepare(w)
+        if (prepared && !queryWords.includes(prepared)) queryWords.push(prepared)
+    }
     if (queryWords.length < 2) {
         const err = new Error('Nearby words search needs at least two words')
         err.code = 'NEARBY_NEEDS_TWO_WORDS'
@@ -240,8 +353,13 @@ const nearbyWordsSearch = function* (strs, query, options = {}) {
     for (const seg of segmenter.segment(haystack)) {
         if (!seg.isWordLike) continue
         wordIndex++
+        const candidate = prepare(seg.segment)
+        if (!candidate) continue
         for (let q = 0; q < K; q++) {
-            if (collator.compare(queryWords[q], seg.segment) === 0) {
+            const hit = fuzzy
+                ? isFuzzyMatch(candidate, queryWords[q])
+                : collator.compare(queryWords[q], candidate) === 0
+            if (hit) {
                 occ.push({ wordIndex, qIdx: q, start: seg.index, end: seg.index + seg.segment.length })
                 break
             }
@@ -279,9 +397,10 @@ const nearbyWordsSearch = function* (strs, query, options = {}) {
 }
 
 export const search = (strs, query, options) => {
-    const { mode } = options
+    const { mode, fuzzy, ignorePunctuation } = options
     if (mode === 'regex') return regexSearch(strs, query, options)
     if (mode === 'nearby-words') return nearbyWordsSearch(strs, query, options)
+    if (fuzzy || ignorePunctuation) return modifierSearch(strs, query, options)
     const { granularity = 'grapheme', sensitivity = 'base' } = options
     if (!Intl?.Segmenter || granularity === 'grapheme'
     && (sensitivity === 'variant' || sensitivity === 'accent'))
@@ -290,14 +409,17 @@ export const search = (strs, query, options) => {
 }
 
 export const searchMatcher = (textWalker, opts) => {
-    const { defaultLocale, matchCase, matchDiacritics, matchWholeWords, mode, nearbyWords, acceptNode } = opts
+    const { defaultLocale, matchCase, matchDiacritics, matchWholeWords, mode, nearbyWords, fuzzy, ignorePunctuation, acceptNode } = opts
     const effectiveMode = mode ?? (matchWholeWords ? 'whole-words' : 'contains')
     return function* (doc, query) {
         const iter = textWalker(doc, function* (strs, makeRange) {
             for (const result of search(strs, query, {
                 mode: effectiveMode,
                 nearbyWords,
+                fuzzy,
+                ignorePunctuation,
                 matchCase,
+                matchDiacritics,
                 locales: doc.body.lang || doc.documentElement.lang || defaultLocale || 'en',
                 granularity: effectiveMode === 'whole-words' ? 'word' : 'grapheme',
                 sensitivity: matchDiacritics && matchCase ? 'variant'
