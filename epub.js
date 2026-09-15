@@ -24,6 +24,8 @@ const MIME = {
 }
 
 // https://www.w3.org/TR/epub-33/#sec-reserved-prefixes
+const READING_WEIGHT = 'https://ampleread.app/vocab#reading-weight'
+
 const PREFIX = {
     a11y: 'http://www.idpf.org/epub/vocab/package/a11y/#',
     dcterms: 'http://purl.org/dc/terms/',
@@ -712,6 +714,18 @@ class Resources {
         this.pageProgressionDirection = $spine
             .getAttribute('page-progression-direction')
 
+        const prefixes = getPrefixes(opf)
+        const $metadata = $(opf.documentElement, 'metadata')
+        this.readingWeights = new Map($metadata
+            ? $$($metadata, 'meta')
+                .filter(el => getPropertyURL(
+                    el.getAttribute('property'), prefixes) === READING_WEIGHT)
+                .map(el => [el.getAttribute('refines'), Number(getElementText(el))])
+                .filter(([refines, weight]) => refines?.startsWith('#')
+                    && Number.isFinite(weight) && weight > 0)
+                .map(([refines, weight]) => [refines.slice(1), weight])
+            : [])
+
         this.navPath = this.getItemByProperty('nav')?.href
         this.ncxPath = (this.getItemByID($spine.getAttribute('toc'))
             ?? this.manifest.find(item => item.mediaType === MIME.NCX))?.href
@@ -1123,7 +1137,8 @@ ${doc.querySelector('parsererror').innerText}`)
                 loadText: () => this.#loader.loadText(item.href),
                 loadContent: () => this.#loader.loadItemXHTMLContent(item),
                 createDocument: () => this.loadDocument(item),
-                size: this.getSize(item.href),
+                size: this.resources.readingWeights.get(idref)
+                    ?? this.getSize(item.href),
                 cfi: this.resources.cfis[index],
                 linear,
                 spineProperties: properties,
