@@ -2626,8 +2626,7 @@ export class Paginator extends HTMLElement {
             // Adjacent sections reuse the primary view's cached layout
             // — they must NOT call #beforeRender, which would modify
             // global state (direction, CSS classes, dir attribute, etc.).
-            const cachedLayout = this.#lastLayout
-            const beforeRender = () => cachedLayout
+            const beforeRender = () => this.#lastLayout
             await view.load(src, data, afterLoad, beforeRender)
             // Cache direction for future preload boundary checks
             if (view.document) {
