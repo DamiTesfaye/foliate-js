@@ -1,3 +1,5 @@
+import * as CFI from './epubcfi.js'
+
 const getTypes = el => new Set([
     ...(el?.getAttributeNS?.('http://www.idpf.org/2007/ops', 'type')?.split(' ') ?? []),
     ...(el?.attributes?.getNamedItem?.('epub:type')?.value?.split(' ') ?? []),
@@ -53,17 +55,76 @@ const extractFootnote = (doc, anchor) => {
     return el
 }
 
+const isTextish = node => node?.nodeType === 3 || node?.nodeType === 4
+
+// Describe how an extracted fragment maps back onto the pristine section
+// document, so a CFI computed against the mutated popup document (whose body
+// is replaced with the fragment) can be translated into one that resolves in
+// the original document, and vice versa. Only ranges with element-aligned
+// boundaries in a single container element are supported (which covers every
+// range built below except resolved CFI ranges); anything else returns null.
+//
+// The mapping works because a CFI child step's index depends only on the
+// number of preceding *element* siblings (elements take even indices, text
+// chunks the odd indices between them), so moving a contiguous, chunk-aligned
+// run of children into an empty body shifts every first-level index by a
+// constant `delta` and leaves all deeper steps untouched.
+export const getExtractMapping = range => {
+    try {
+        const container = range.startContainer
+        if (container !== range.endContainer || container.nodeType !== 1) return null
+        const children = Array.from(container.childNodes)
+        // a start boundary that splits a text chunk cannot be mapped: the cut
+        // would change character offsets within the popup's first chunk
+        if (isTextish(children[range.startOffset - 1])
+            && isTextish(children[range.startOffset])) return null
+        const countElements = nodes => nodes.filter(n => n.nodeType === 1).length
+        const delta = 2 * countElements(children.slice(0, range.startOffset))
+        const endElements = 2 * countElements(children.slice(0, range.endOffset))
+        const collapsed = container.ownerDocument.createRange()
+        collapsed.setStart(container, 0)
+        collapsed.collapse(true)
+        return {
+            // collapsed CFI (document part only) of the container element
+            containerCfi: CFI.fromRange(collapsed),
+            delta,
+            // first/last first-level indices (in original-document terms)
+            // covered by the extracted range, for reverse mapping
+            firstIndex: delta + (isTextish(children[range.startOffset]) ? 1 : 2),
+            lastIndex: endElements + (isTextish(children[range.endOffset - 1]) ? 1 : 0),
+        }
+    } catch {
+        return null
+    }
+}
+
+// Move a note into the popup body. The element the note is extracted from
+// goes with it, and books often set the note's font on exactly that element
+// (e.g. `li.duokan-footnote-item { font-family: ... }`), so carry it over
+export const extractToBody = (doc, range) => {
+    const container = range.commonAncestorContainer
+    const el = container.nodeType === 1 ? container : container.parentElement
+    const { fontFamily } = doc.defaultView.getComputedStyle(el)
+    const frag = range.extractContents()
+    doc.body.replaceChildren()
+    doc.body.appendChild(frag)
+    doc.body.style.fontFamily = fontFamily
+}
+
 export class FootnoteHandler extends EventTarget {
     detectFootnotes = true
     #showFragment(book, { index, anchor, check }, href) {
         const view = document.createElement('foliate-view')
+        let loaded = false
         return new Promise((resolve, reject) => {
             view.addEventListener('load', e => {
+                loaded = true
                 try {
                     const { doc } = e.detail
                     const el = anchor(doc)
                     const type = getReferencedType(el)
                     const hidden = el?.matches?.('aside') && type === 'footnote'
+                    let extract = null
                     if (el) {
                         let range
                         if (el.startContainer) {
@@ -116,11 +177,16 @@ export class FootnoteHandler extends EventTarget {
                                 range.selectNode(el)
                             }
                         }
-                        const frag = range.extractContents()
-                        doc.body.replaceChildren()
-                        doc.body.appendChild(frag)
+                        extract = getExtractMapping(range)
+                        extractToBody(doc, range)
+                    } else {
+                        // no anchor: the popup shows the whole pristine
+                        // section, so the mapping is the identity over body
+                        const r = doc.createRange()
+                        r.selectNodeContents(doc.body)
+                        extract = getExtractMapping(r)
                     }
-                    const detail = { view, href, type, hidden, target: el }
+                    const detail = { view, href, type, hidden, target: el, index, extract }
                     this.dispatchEvent(new CustomEvent('render', { detail }))
                     resolve()
                 } catch (e) {
@@ -129,7 +195,12 @@ export class FootnoteHandler extends EventTarget {
             })
             view.open(book)
                 .then(() => this.dispatchEvent(new CustomEvent('before-render', { detail: { view } })))
-                .then(() => view.goTo(index))
+                // Go to the anchor, not just the section: a section too big
+                // to render whole is shown in chunks (section-chunks.js), and
+                // the anchor picks the one holding the note. The note is
+                // extracted on load, then shown from the top.
+                .then(() => view.renderer.goTo({
+                    index, anchor: doc => loaded ? 0 : anchor(doc) }))
                 .catch(reject)
         })
     }

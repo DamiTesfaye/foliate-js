@@ -21,6 +21,12 @@ const getAlphabet = el => {
     return x ? x : el.parentElement ? getAlphabet(el.parentElement) : null
 }
 
+// A segment ending in one of these is merged into the next instead of ending a
+// sentence: titles, an initial or dotted capitals (J. R. R., U.S.), and labels
+// that precede a number. Only abbreviations that come before a capital or a
+// digit need listing; the segmenter never breaks before a lowercase word.
+const endsWithAbbreviation = /[\s.](?:Mrs?|Ms|Dr|Prof|Rev|St|Mt|Jr|Sr|No|Vol|Ch|Fig|pp?|[A-Z])\.\s*$/
+
 const getSegmenter = (lang, granularity = 'word') => {
     const segmenter = new Intl.Segmenter(lang || undefined, { granularity })
     const granularityIsWord = granularity === 'word'
@@ -34,7 +40,7 @@ const getSegmenter = (lang, granularity = 'word') => {
         for (let i = 0, j = 0; i < rawSegments.length; i++) {
             const current = rawSegments[i]
             const segment = ' ' + current.segment
-            const endsWithAbbr = /\s([A-Z]{1,2}[a-z]{0,5}|[a-z]{1,3})\.\s*$/.test(segment)
+            const endsWithAbbr = endsWithAbbreviation.test(segment)
             if (!endsWithAbbr || i >= (rawSegments.length-1)) {
                 const mergedSegment = {
                     index: rawSegments[j].index,
@@ -124,12 +130,17 @@ const fragmentToSSML = (fragment, nodeFilter, inherited) => {
     return ssml
 }
 
+// The marks go into a copy owned by a document of its own: a document updates
+// every one of its live ranges on each mutation, and a section can hold a
+// range for each of its thousands of sentences (a read-aloud timeline does)
+let markDocument
 const getFragmentWithMarks = (range, textWalker, nodeFilter, granularity) => {
     const lang = getLang(range.commonAncestorContainer)
     const alphabet = getAlphabet(range.commonAncestorContainer)
 
     const segmenter = getSegmenter(lang, granularity)
-    const fragment = range.cloneContents()
+    markDocument ??= document.implementation.createHTMLDocument('')
+    const fragment = markDocument.importNode(range.cloneContents(), true)
 
     // we need ranges on both the original document (for highlighting)
     // and the document fragment (for inserting marks)
@@ -252,9 +263,15 @@ function* getBlocks(doc, nodeFilter) {
         if (blockTags.has(name)) {
             if (last) {
                 last.setEndBefore(node)
-                if (!rangeIsEmpty(last)) yield last
+                if (!rangeIsEmpty(last)) {
+                    yield last
+                    last = null
+                }
             }
-            last = doc.createRange()
+            // Reuse the range of an empty block: a document updates every
+            // live range on each mutation, and a single-file book (or a chunk
+            // of one, with its placeholders) can have thousands of them
+            last ??= doc.createRange()
             last.setStart(node, 0)
             sawBlock = true
         }

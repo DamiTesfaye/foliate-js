@@ -23,6 +23,39 @@ const MIME = {
     JS: /\/(x-)?(javascript|ecmascript)/,
 }
 
+// a document declared XHTML that the XML parser could not parse
+const isBrokenXHTML = doc => doc.querySelector('parsererror')
+    || !doc.documentElement?.namespaceURI
+// Void elements that Adobe InDesign / Digital Editions exports leave unclosed
+// (`<meta charset="utf-8">` constantly), the usual reason such a file is not
+// well-formed XML. Lowercase only: XHTML is case-sensitive, and an uppercase
+// `<BR>` closed as `<BR/>` would parse as an unknown element instead of a
+// line break, so those files keep taking the HTML path.
+const VOID_ELEMENT_RE = /<(meta|link|br|img|hr|input|col|area|base|embed|param|source|track|wbr)(?=[\s/>])((?:[^<>"']|"[^"]*"|'[^']*')*)>/g
+const closeVoidElements = str => str.replace(VOID_ELEMENT_RE,
+    (tag, name, attrs) => attrs.trimEnd().endsWith('/') ? tag : `<${name}${attrs}/>`)
+// Parse a content document. A file the manifest declares as XHTML but which
+// is not well-formed XML first gets its unclosed void elements closed and is
+// parsed as XML again; only if that still fails is it parsed as HTML. The
+// HTML parser is not a faithful reading of such a file: it ignores `/>` on
+// non-void elements and re-opens formatting elements across blocks, so an
+// `<a id="page_25"/>` at the top of a paragraph swallows every following
+// `<p>` until the next anchor, and positions (CFIs, other readers' locators)
+// stop matching the book's real structure. Shared by the render path
+// (`loadReplaced`) and the off-screen path (`loadDocument`) so both see the
+// same DOM.
+const parseContentDocument = (parser, str, mediaType) => {
+    let doc = parser.parseFromString(str, mediaType)
+    if (mediaType !== MIME.XHTML || !isBrokenXHTML(doc)) return { doc, mediaType }
+    const repaired = closeVoidElements(str)
+    if (repaired !== str) {
+        doc = parser.parseFromString(repaired, mediaType)
+        if (!isBrokenXHTML(doc)) return { doc, mediaType }
+    }
+    console.warn(doc.querySelector('parsererror')?.innerText ?? 'Invalid XHTML')
+    return { doc: parser.parseFromString(str, MIME.HTML), mediaType: MIME.HTML }
+}
+
 // https://www.w3.org/TR/epub-33/#sec-reserved-prefixes
 const READING_WEIGHT = 'https://ampleread.app/vocab#reading-weight'
 
@@ -135,13 +168,33 @@ const pathRelative = (from, to) => {
 
 const pathDirname = str => str.slice(0, str.lastIndexOf('/') + 1)
 
-// replace asynchronously and sequentially
+// Run `f` over `items` with bounded concurrency, preserving order. Resource
+// loads inside `loadReplaced` used to be fully serial -- one image/CSS after
+// another, each paying its own ZIP read, which stacks up on image-heavy
+// sections (worse on weak devices). Tasks are independent; a rejection still
+// propagates through Promise.all, just like the old serial loop aborted at
+// the first failure. Order is preserved by writing into preallocated slots.
+const mapBounded = async (items, f, limit = 4) => {
+    if (!items.length) return []
+    const results = new Array(items.length)
+    let next = 0
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) },
+        async () => {
+            while (next < items.length) {
+                const i = next++
+                results[i] = await f(items[i], i)
+            }
+        }))
+    return results
+}
+
+// replace asynchronously; matches were resolved with bounded concurrency
+// (was: strictly sequential) and are substituted back in match order
 // same technique as https://stackoverflow.com/a/48032528
 const replaceSeries = async (str, regex, f) => {
     const matches = []
     str.replace(regex, (...args) => (matches.push(args), null))
-    const results = []
-    for (const args of matches) results.push(await f(...args))
+    const results = await mapBounded(matches, args => f(...args))
     return str.replace(regex, () => results.shift())
 }
 
@@ -495,6 +548,28 @@ const getFontMediaType = (path) => {
     return mediaTypeMap[extension] || 'font/ttf'
 }
 
+const AUDIO_VIDEO_MEDIA_TYPES = {
+    'mp4': 'video/mp4',
+    'm4v': 'video/mp4',
+    'webm': 'video/webm',
+    'ogv': 'video/ogg',
+    'mov': 'video/quicktime',
+    'mp3': 'audio/mpeg',
+    'm4a': 'audio/mp4',
+    'm4b': 'audio/mp4',
+    'aac': 'audio/aac',
+    'oga': 'audio/ogg',
+    'ogg': 'audio/ogg',
+    'opus': 'audio/ogg',
+    'wav': 'audio/wav',
+    'flac': 'audio/flac',
+}
+
+const AUDIO_VIDEO_EXTENSIONS = Object.keys(AUDIO_VIDEO_MEDIA_TYPES)
+
+const getAudioVideoMediaType = path =>
+    AUDIO_VIDEO_MEDIA_TYPES[path.toLowerCase().split('.').pop()]
+
 // Container entry whose file name ends in `cover`/`couv` (the French
 // spelling) plus an image extension, e.g. `cover.jpg`, `Images/Cover.PNG`,
 // `couv.jpeg`. Same shape `gnome-epub-thumbnailer` falls back to.
@@ -819,11 +894,14 @@ class Resources {
                 href: resolveHref(href),
             }))
 
+        const coverMeta = $$$(opf, 'meta')
+            .find(filterAttribute('name', 'cover'))
+            ?.getAttribute('content')
         this.cover = this.getItemByProperty('cover-image')
-            // EPUB 2 compat
-            ?? this.getItemByID($$$(opf, 'meta')
-                .find(filterAttribute('name', 'cover'))
-                ?.getAttribute('content'))
+            // EPUB 2 compat; some producers put the image's href in `content`
+            // instead of its manifest id
+            ?? this.getItemByID(coverMeta)
+            ?? (coverMeta ? this.getItemByHref(resolveHref(coverMeta)) : null)
             ?? this.manifest.find(item => item.id === 'cover'
                 && item.mediaType.startsWith('image'))
             ?? this.manifest.find(item => item.href.includes('cover')
@@ -899,6 +977,19 @@ class Loader {
         return url
     }
     ref(href, parent) {
+        // A top-level load -- a view opening a section -- has no parent
+        // document to hang the reference on, and is released by exactly one
+        // `unloadItem`, so it must always be counted. Recording it under an
+        // absent parent instead put every top-level load in the book into one
+        // shared `#children` bucket that nothing ever cleared, so the second
+        // view to open an already-loaded section (a footnote popup, which
+        // opens another view on the same book) skipped its increment yet still
+        // decremented on close. The count underflowed to zero and revoked the
+        // section along with its images while a view was still showing them.
+        if (!parent) {
+            this.#refCount.set(href, this.#refCount.get(href) + 1)
+            return this.#cache.get(href)
+        }
         const childList = this.#children.get(parent)
         if (!childList?.includes(href)) {
             this.#refCount.set(href, this.#refCount.get(href) + 1)
@@ -951,7 +1042,11 @@ class Loader {
         return this.createURL(href, tryLoadBlob, mediaType, parent)
     }
     async loadItemXHTMLContent(item, parents = []) {
-        const url = await this.loadItem(item, parents)
+        // Callers read the source of a section they have just loaded (the
+        // renderer pairs `section.load()` with `section.loadContent()`), and
+        // there is no matching unload for this call, so reuse the reference
+        // they already hold rather than taking one that is never released.
+        const url = this.#cache.get(item?.href) ?? await this.loadItem(item, parents)
         if (url) return this.#cacheXHTMLContent.get(url)?.data
     }
     tryImageEntryItem(path) {
@@ -981,12 +1076,29 @@ class Loader {
             mediaType: getFontMediaType(path),
         }
     }
+    // Builders like epubBuilder (cnepub) ship audio and video in the container
+    // but never declare them in the manifest, the same way they leave out the
+    // illustrations. A relative href can't resolve against the section's
+    // `blob:` URL, so the media element would otherwise end up with no source.
+    tryAudioVideoEntryItem(path) {
+        if (!AUDIO_VIDEO_EXTENSIONS.some(ext => path.toLowerCase().endsWith(`.${ext}`))) {
+            return null
+        }
+        if (!this.entries.get(path)) {
+            return null
+        }
+        return {
+            href: path,
+            mediaType: getAudioVideoMediaType(path),
+        }
+    }
     async loadHref(href, base, parents = []) {
         if (isExternal(href)) return href
         const path = resolveURL(href, base)
         let item = this.manifest.find(item => item.href === path)
         if (!item) {
             item = this.tryImageEntryItem(path) ?? this.tryFontEntryItem(path)
+                ?? this.tryAudioVideoEntryItem(path)
             if (!item) {
                 return href
             }
@@ -1015,14 +1127,10 @@ class Loader {
 
         // parse and replace in HTML
         if ([MIME.XHTML, MIME.HTML, MIME.SVG].includes(mediaType)) {
-            let doc = new DOMParser().parseFromString(str, mediaType)
-            // change to HTML if it's not valid XHTML
-            if (mediaType === MIME.XHTML && (doc.querySelector('parsererror')
-            || !doc.documentElement?.namespaceURI)) {
-                console.warn(doc.querySelector('parsererror')?.innerText ?? 'Invalid XHTML')
-                item.mediaType = MIME.HTML
-                doc = new DOMParser().parseFromString(str, item.mediaType)
-            }
+            const parsed = parseContentDocument(new DOMParser(), str, mediaType)
+            const doc = parsed.doc
+            // it's now HTML if it wasn't valid XHTML even after repair
+            item.mediaType = parsed.mediaType
             // replace hrefs in XML processing instructions
             // this is mainly for SVGs that use xml-stylesheet
             if ([MIME.XHTML, MIME.SVG].includes(item.mediaType)) {
@@ -1039,28 +1147,41 @@ class Loader {
                     child = child.nextSibling
                 }
             }
+            // Duokan packs a taller `~slim` variant beside an image
+            // (`cover~slim.jpg` next to `cover.jpg`) for tall phone screens;
+            // expose it so the paginator can swap it in for a full-page cover
+            // (readest/readest#6513)
+            await mapBounded([...doc.querySelectorAll('img[src]')], async el => {
+                const slim = el.getAttribute('src').replace(/(\.\w+)$/, '~slim$1')
+                const url = await this.loadHref(slim, href, parents)
+                if (url !== slim) el.setAttribute('data-duokan-slim-src', url)
+            })
             // replace hrefs (excluding anchors)
             const replace = async (el, attr) => el.setAttribute(attr,
                 await this.loadHref(el.getAttribute(attr), href, parents))
-            for (const el of doc.querySelectorAll('link[href]')) await replace(el, 'href')
-            for (const el of doc.querySelectorAll('[src]')) await replace(el, 'src')
-            for (const el of doc.querySelectorAll('[poster]')) await replace(el, 'poster')
-            for (const el of doc.querySelectorAll('object[data]')) await replace(el, 'data')
-            for (const el of doc.querySelectorAll('[*|href]:not([href])'))
-                el.setAttributeNS(NS.XLINK, 'href', await this.loadHref(
-                    el.getAttributeNS(NS.XLINK, 'href'), href, parents))
-            for (const el of doc.querySelectorAll('[srcset]'))
-                el.setAttribute('srcset', await replaceSeries(el.getAttribute('srcset'),
+            const attrTasks = [
+                [...doc.querySelectorAll('link[href]')].map(el => [el, 'href']),
+                [...doc.querySelectorAll('[src]')].map(el => [el, 'src']),
+                [...doc.querySelectorAll('[poster]')].map(el => [el, 'poster']),
+                [...doc.querySelectorAll('object[data]')].map(el => [el, 'data']),
+            ].flat()
+            await mapBounded(attrTasks, ([el, attr]) => replace(el, attr))
+            await mapBounded([...doc.querySelectorAll('[*|href]:not([href])')],
+                async el => el.setAttributeNS(NS.XLINK, 'href', await this.loadHref(
+                    el.getAttributeNS(NS.XLINK, 'href'), href, parents)))
+            await mapBounded([...doc.querySelectorAll('[srcset]')],
+                async el => el.setAttribute('srcset', await replaceSeries(el.getAttribute('srcset'),
                     /(\s*)(.+?)\s*((?:\s[\d.]+[wx])+\s*(?:,|$)|,\s+|$)/g,
                     (_, p1, p2, p3) => this.loadHref(p2, href, parents)
-                        .then(p2 => `${p1}${p2}${p3}`)))
+                        .then(p2 => `${p1}${p2}${p3}`))))
             // replace inline styles
-            for (const el of doc.querySelectorAll('style'))
+            await mapBounded([...doc.querySelectorAll('style')], async el => {
                 if (el.textContent) el.textContent =
                     await this.replaceCSS(el.textContent, href, parents)
-            for (const el of doc.querySelectorAll('[style]'))
-                el.setAttribute('style',
-                    await this.replaceCSS(el.getAttribute('style'), href, parents))
+            })
+            await mapBounded([...doc.querySelectorAll('[style]')],
+                async el => el.setAttribute('style',
+                    await this.replaceCSS(el.getAttribute('style'), href, parents)))
             // TODO: replace inline scripts? probably not worth the trouble
             const result = new XMLSerializer().serializeToString(doc)
             return this.createURL(href, result, item.mediaType, parent)
@@ -1216,6 +1337,11 @@ ${doc.querySelector('parsererror').innerText}`)
                 unload: () => this.#loader.unloadItem(item),
                 loadText: () => this.#loader.loadText(item.href),
                 loadContent: () => this.#loader.loadItemXHTMLContent(item),
+                // Load a resource a script references after the section was
+                // rendered (a <video src> built on click); `loadReplaced` only
+                // saw what was in the markup. The section is its parent, so it
+                // is released together with the section.
+                loadHref: href => this.#loader.loadHref(href, item.href),
                 createDocument: () => this.loadDocument(item),
                 size: this.resources.readingWeights.get(idref)
                     ?? this.getSize(item.href),
@@ -1275,17 +1401,9 @@ ${doc.querySelector('parsererror').innerText}`)
         return this
     }
     async loadDocument(item) {
-        const str = await this.loadText(item.href)
-        const doc = this.parser.parseFromString(str, item.mediaType)
-        // Same fallback as the render path in `loadReplaced`: a file the
-        // manifest declares as XHTML but which isn't well-formed XML (an
-        // unclosed `<meta charset>` is the usual culprit) parses into a
-        // `parsererror` document whose `body` is null. Callers of
-        // `createDocument` walk that body, so retry as HTML instead.
-        if (item.mediaType === MIME.XHTML
-        && (doc.querySelector('parsererror') || !doc.documentElement?.namespaceURI))
-            return this.parser.parseFromString(str, MIME.HTML)
-        return doc
+        // a spine item missing from the archive loads as an empty document
+        const str = await this.loadText(item.href) ?? ''
+        return parseContentDocument(this.parser, str, item.mediaType).doc
     }
     getMediaOverlay() {
         return new MediaOverlay(this, this.#loadXML.bind(this))
