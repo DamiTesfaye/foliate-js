@@ -1561,6 +1561,7 @@ export class Paginator extends HTMLElement {
     #fillPromise = null // tracks in-progress #fillVisibleArea for awaiting
     #stabilizing = false // true while #display is stabilizing layout
     #rendered = false // true after first #display completes
+    #navigating = null // the last goTo or section jump, awaited before turning off a section
     #lastLayout = null // cached layout from the last #beforeRender call
     #columnGap = null // px; set by `column-gap`, overrides the centre gap of a spread
     // Cache of section index → vertical (boolean). Populated as views
@@ -3891,6 +3892,10 @@ export class Paginator extends HTMLElement {
         try {
             const src = await section.load()
             const data = await section.loadContent?.()
+            // A navigation can move the strip while this loads; a view that
+            // no longer joins it would sit beside the wrong section
+            const joined = [-1, 1].some(dir => this.#views.has(this.#adjacentIndex(dir, index)))
+            if (this.#views.has(index) || !joined) return
             const view = this.#createView(index)
             const afterLoad = async doc => {
                 if (doc.head) {
@@ -4119,10 +4124,17 @@ export class Paginator extends HTMLElement {
             if (directionChanged) {
                 this.#destroyAllViews()
             } else {
+                // Keep only neighbours joined to the target: a kept view past a
+                // gap would sit beside it on screen and turning would skip sections
                 const keep = new Set([index])
                 if (!this.noContinuousScroll) {
-                    for (const [i] of this.#views) {
-                        if (Math.abs(i - index) <= 2) keep.add(i)
+                    for (const dir of [-1, 1]) {
+                        let i = index
+                        for (let step = 0; step < 2; step++) {
+                            i = this.#adjacentIndex(dir, i)
+                            if (i == null || !this.#views.has(i)) break
+                            keep.add(i)
+                        }
                     }
                 }
                 this.#clearViewsExcept(keep)
@@ -4151,11 +4163,11 @@ export class Paginator extends HTMLElement {
     async goTo(target) {
         if (this.#locked) return
         const resolved = await this.#toUnitTarget(await target)
-        if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
+        if (this.#canGoToIndex(resolved.index)) return this.#navigating = this.#goTo(resolved)
     }
     async #goToUnit(index) {
         if (this.#locked) return
-        if (this.#canGoToIndex(index)) return this.#goTo({ index })
+        if (this.#canGoToIndex(index)) return this.#navigating = this.#goTo({ index })
     }
     #scrollPrev(distance) {
         if (this.#views.size === 0) return true
@@ -4215,12 +4227,19 @@ export class Paginator extends HTMLElement {
         if (this.#locked) return
         this.#locked = true
         const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
+        const scroll = () => prev ? this.#scrollPrev(distance) : this.#scrollNext(distance)
+        let shouldGo = await scroll()
         if (shouldGo) {
-            // Wait for any in-progress background pre-loading to complete —
-            // it may already be loading the section we need, so awaiting
-            // it lets #goTo reuse the view instead of loading from scratch
+            // Mid-navigation the strip can read as too few pages (a section
+            // still loading, a neighbour inserted before the scroll catches
+            // up), which would skip sections, so finish it and decide again.
+            // The fill may also already be loading the section we need, so
+            // awaiting it lets #goTo reuse the view.
+            await this.#navigating?.catch(() => {})
             if (this.#fillPromise) await this.#fillPromise
+            shouldGo = await scroll()
+        }
+        if (shouldGo) {
             const sorted = this.#sortedViews
             const edgeIndex = prev
                 ? sorted[0]?.[0] ?? this.#primaryIndex
